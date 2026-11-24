@@ -150,8 +150,12 @@ def _scan(volume_maj, volume_min):
     return files, groups
 
 
-def take_snapshot(volume_path, snap_id):
-    """对日志卷做一次盘点，返回快照 dict（可直接 JSON 序列化）。"""
+def take_snapshot(volume_path, snap_id, seq):
+    """对日志卷做一次盘点，返回快照 dict（可直接 JSON 序列化）。
+
+    seq 为服务端在采集开始时分配的全局采集序号：同一时刻可并发盘点，
+    但谁先开始采集，谁的序号就更小，新旧以该序号为准。
+    """
     maj, min_, mountpoint = resolve_volume(volume_path)
     vfs = os.statvfs(volume_path)
     files, groups = _scan(maj, min_)
@@ -166,6 +170,7 @@ def take_snapshot(volume_path, snap_id):
         group_map[str(g["pgid"])] = g
     return {
         "id": snap_id,
+        "seq": seq,
         "taken_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "volume": {
             "path": volume_path,

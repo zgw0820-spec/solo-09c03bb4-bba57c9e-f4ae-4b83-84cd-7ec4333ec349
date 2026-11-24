@@ -34,6 +34,8 @@
   .panel.bad-panel { border-color: var(--bad); background: #fff5f5; }
   ul { margin: 6px 0; padding-left: 20px; }
   code { background: #eff1f3; padding: 1px 4px; border-radius: 4px; }
+  #stale-note { display: none; margin-top: 10px; padding: 6px 10px; border-radius: 6px;
+                background: #fff8c5; border: 1px solid #d4a72c; color: #4d3d00; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -76,13 +78,64 @@
       <tbody></tbody>
     </table>
     <div class="panel" id="review-result"></div>
+    <div id="stale-note"></div>
   </section>
 </main>
 
 <script>
 const MAX_GROUPS = {{ max_groups }};
 let snapshot = null, plans = [];
+let shownReview = null;  // 复核详情面板当前展示的复核（含所属方案 id 与采集序号）
 const selected = new Set();
+
+function planNum(p){ return parseInt(p.id.slice(1), 10); }
+
+// ---- 并发响应的单调合并：迟到的旧响应不能让页面倒退 ----
+
+// 用响应里的新快照替换当前盘点，仅当它比已显示的快照更新（服务端开始采集序号更大）。
+function applySnapshot(snap){
+  if (!snap) return false;
+  if (snapshot && snap.seq <= snapshot.seq) return false;
+  snapshot = snap;
+  return true;
+}
+
+// 合并方案列表：保留已显示的全部方案，新方案并入；同一方案的复核结论只接受更新的那次。
+function mergePlans(list){
+  const byId = new Map(plans.map(p => [p.id, p]));
+  for (const incoming of list || []){
+    const old = byId.get(incoming.id);
+    if (!old){
+      byId.set(incoming.id, incoming);
+    } else if (incoming.review && (!old.review || incoming.review.seq > old.review.seq)){
+      old.review = incoming.review;
+    }
+  }
+  plans = [...byId.values()].sort((a, b) => planNum(b) - planNum(a));
+}
+
+// 某次响应到达后，只应用其中比当前页面更新的部分，返回是否有内容因过旧被忽略。
+function applyResponse(j){
+  let stale = false;
+  if (j.snapshot !== undefined && !applySnapshot(j.snapshot)) stale = true;
+  if (j.plans !== undefined) mergePlans(j.plans);
+  return stale;
+}
+
+// 复核详情只接受比当前面板更新的复核（按同一方案的采集序号），旧复核迟到时面板不动。
+function reviewIsNewer(rv){
+  const cur = shownReview;
+  return !cur || cur.plan_id !== rv.plan_id || rv.seq > cur.seq;
+}
+
+let staleTimer = null;
+function noteStale(msg){
+  const el = document.getElementById('stale-note');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(staleTimer);
+  staleTimer = setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
 
 function fmtMiB(b){ return (b/1048576).toFixed(1) + " MiB"; }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -99,7 +152,7 @@ async function api(path, body){
 async function doScan(){
   try {
     const j = await api('/api/inventory', {});
-    snapshot = j.snapshot; plans = j.plans;
+    if (applyResponse(j)) noteStale('收到一个更早开始的盘点响应，已保留页面上更新的盘点结果。');
     render();
   } catch(e){ alert('盘点失败：' + e.message); }
 }
@@ -107,7 +160,10 @@ async function doScan(){
 async function load(){
   try {
     const j = await api('/api/state');
-    snapshot = j.snapshot; plans = j.plans;
+    // 页面刚加载，直接以服务端当前状态初始化
+    snapshot = j.snapshot;
+    plans = [];
+    mergePlans(j.plans);
     render();
   } catch(e){ alert('加载失败：' + e.message); }
 }
@@ -123,7 +179,7 @@ async function doPlan(){
       groups: [...selected],
       target_bytes: Math.round(t * 1048576)
     });
-    plans = j.plans;
+    mergePlans(j.plans);
     showPlanResult(j, t);
     render();
   } catch(e){ alert('生成方案失败：' + e.message); }
@@ -132,8 +188,15 @@ async function doPlan(){
 async function doReview(planId){
   try {
     const j = await api('/api/review', {plan_id: planId});
-    snapshot = j.snapshot; plans = j.plans;
-    showReviewResult(j.review);
+    const stale = applyResponse(j);
+    j.review.plan_id = planId;
+    if (reviewIsNewer(j.review)){
+      shownReview = j.review;
+      showReviewResult(j.review);
+    } else {
+      noteStale('该复核响应迟到，页面保留的是同一方案最后开始的那次复核结论。');
+    }
+    if (stale) noteStale('复核带回的盘点比页面上的旧，已保留更新的盘点与方案列表。');
     render();
   } catch(e){ alert('复核失败：' + e.message); }
 }

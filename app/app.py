@@ -4,6 +4,15 @@
 流程：盘点（POST /api/inventory）→ 勾选 ≤12 个进程组并填目标空间
 → 生成方案（POST /api/plan，用同一次盘点快照计算）→ 复核（POST /api/review，
 重新盘点并比对，发现变化或更优方案即作废旧方案）。
+
+并发语义：
+- 各次采集（普通盘点与复核的重新盘点）可同时进行；每次采集在**开始时**
+  领取一个全局递增序号 _collection_seq，新旧一律以"服务端开始采集的顺序"为准。
+- 卷的当前盘点只接受"最后开始的那次成功采集"：序号更小的采集即便更晚
+  返回，也不能覆盖当前盘点。
+- 每个方案各自保留"最后开始的那次成功复核"，其他采集更新卷的当前盘点
+  不影响该方案自己的复核结论。
+- 采集失败不改动任何已生效状态，其他成功采集照常生效。
 """
 
 import itertools
@@ -21,7 +30,7 @@ MAX_GROUPS = 12
 
 app = Flask(__name__)
 _lock = threading.Lock()
-_snap_seq = itertools.count(1)
+_collection_seq = itertools.count(1)  # 采集（盘点/复核）开始顺序的全局序号
 _plan_seq = itertools.count(1)
 _snapshots = {}  # snap_id -> snapshot
 _plans = {}      # plan_id -> plan
@@ -40,8 +49,32 @@ def _mib(n):
     return f"{n / 1048576:.1f} MiB"
 
 
+def _plan_order(plan):
+    # 方案 id 形如 pN，按数值排序（避免 p10 排在 p2 前面）
+    return int(plan["id"][1:])
+
+
 def _plans_list():
-    return sorted(_plans.values(), key=lambda p: p["id"], reverse=True)
+    return sorted(_plans.values(), key=_plan_order, reverse=True)
+
+
+def _commit_snapshot(snap):
+    """登记一次成功采集的快照（调用方须持有 _lock）。
+
+    只有比当前盘点更晚开始（序号更大）的采集才能成为卷的当前盘点；
+    迟到的较早采集只留档，不覆盖当前盘点。
+    """
+    global _current_snap_id
+    _snapshots[snap["id"]] = snap
+    current = _snapshots.get(_current_snap_id) if _current_snap_id else None
+    if current is None or snap["seq"] > current["seq"]:
+        _current_snap_id = snap["id"]
+
+
+def _start_collection():
+    """领取采集序号（在真正扫描之前调用，故序号即"开始采集"的顺序）。"""
+    with _lock:
+        return next(_collection_seq)
 
 
 # ---------------- 页面 ----------------
@@ -55,11 +88,15 @@ def index():
 
 @app.post("/api/inventory")
 def api_inventory():
-    global _current_snap_id
-    snap = take_snapshot(LOG_VOLUME, f"s{next(_snap_seq)}")
+    # 序号在扫描前领取：并发采集的新旧以服务端开始采集的顺序为准
+    seq = _start_collection()
+    snap_id = f"s{seq}"
+    try:
+        snap = take_snapshot(LOG_VOLUME, snap_id, seq)
+    except Exception as exc:  # 采集失败：保留全部已生效状态
+        return _err(f"盘点失败：{exc}", 500)
     with _lock:
-        _snapshots[snap["id"]] = snap
-        _current_snap_id = snap["id"]
+        _commit_snapshot(snap)
         plans = _plans_list()
     return jsonify({"snapshot": snap, "plans": plans})
 
@@ -137,8 +174,11 @@ def api_plan():
 
 # ---------------- 复核 ----------------
 
-def _review(plan, old_snap, new_snap):
-    """比对方案所依据的旧盘点与新盘点，返回复核结论。"""
+def _review(plan, old_snap, new_snap, seq):
+    """比对方案所依据的旧盘点与新盘点，返回复核结论。
+
+    seq 为本次复核采集的开始顺序号，写入结论中，供前端判断迟到响应。
+    """
     invalidations, notices = [], []
     new_files = {f["key"]: f for f in new_snap["files"]}
     old_files = {f["key"]: f for f in old_snap["files"]}
@@ -203,13 +243,13 @@ def _review(plan, old_snap, new_snap):
             "max_freeable": opt["max_freeable"],
         },
         "checked_at": _now(),
+        "seq": seq,
         "snapshot_id": new_snap["id"],
     }
 
 
 @app.post("/api/review")
 def api_review():
-    global _current_snap_id
     body = request.get_json(force=True, silent=True) or {}
     plan_id = body.get("plan_id")
     with _lock:
@@ -218,12 +258,21 @@ def api_review():
     if plan is None or old_snap is None:
         return _err("方案或其盘点快照不存在", 404)
 
-    new_snap = take_snapshot(LOG_VOLUME, f"s{next(_snap_seq)}")  # 复核时重新盘点
-    review = _review(plan, old_snap, new_snap)
+    # 复核也是一次采集：序号在扫描前领取，与普通盘点共用同一顺序
+    seq = _start_collection()
+    snap_id = f"s{seq}"
+    try:
+        new_snap = take_snapshot(LOG_VOLUME, snap_id, seq)  # 复核时重新盘点
+        review = _review(plan, old_snap, new_snap, seq)
+    except Exception as exc:  # 采集/比对失败：方案复核结论与当前盘点均保持原样
+        return _err(f"复核失败：{exc}", 500)
+
     with _lock:
-        _snapshots[new_snap["id"]] = new_snap
-        _current_snap_id = new_snap["id"]
-        plan["review"] = review
+        _commit_snapshot(new_snap)  # 可能不是最新开始的采集，则只留档不置顶
+        # 每个方案各自只保留最后开始的那次成功复核
+        prev = plan.get("review")
+        if prev is None or review["seq"] > prev["seq"]:
+            plan["review"] = review
         plans = _plans_list()
     return jsonify({"review": review, "snapshot": new_snap, "plans": plans})
 
